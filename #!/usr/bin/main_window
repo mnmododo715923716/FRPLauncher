@@ -1,0 +1,708 @@
+"""
+主界面 - 显示和管理端口映射
+"""
+
+from PyQt5.QtWidgets import (
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QPushButton, QTableWidget, QTableWidgetItem,
+    QHeaderView, QMessageBox, QInputDialog, QMenu,
+    QAction, QSystemTrayIcon, QApplication, QToolBar,
+    QStatusBar, QProgressBar, QSplitter, QScrollArea
+)
+from PyQt5.QtCore import (
+    Qt, QTimer, pyqtSignal, QSize, QPoint, QSettings
+)
+from PyQt5.QtGui import (
+    QFont, QIcon, QColor, QBrush, QPainter, QPen,
+    QPixmap, QCursor
+)
+
+from config_manager import ConfigManager
+from port_scanner import PortScanner, PortInfo
+from frpc_controller import FrpcController, ProxyStatus
+import traceback
+
+class PortItemWidget(QWidget):
+    """端口项自定义部件"""
+
+    clicked = pyqtSignal(int)  # 端口号
+
+    def __init__(self, port_info: PortInfo, is_mapped: bool = False,
+                 frpc_available: bool = True, status_text: str = ""):
+        super().__init__()
+        self.port_info = port_info
+        self.is_mapped = is_mapped
+        self.frpc_available = frpc_available
+        self.status_text = status_text
+        self.is_hovered = False
+        self.setup_ui()
+        self.setMouseTracking(True)
+        self.setFixedHeight(70)  # 固定高度，保持统一
+
+    def setup_ui(self):
+        """设置UI"""
+        layout = QHBoxLayout()
+        layout.setContentsMargins(15, 10, 15, 10)
+        layout.setSpacing(10)
+
+        # 左侧：端口信息
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+
+        # 端口号和进程名
+        port_text = f"端口: {self.port_info.port}"
+        if self.port_info.process_name:
+            port_text += f" ({self.port_info.process_name})"
+
+        port_label = QLabel(port_text)
+        port_label.setFont(QFont("微软雅黑", 11, QFont.Bold))
+        port_label.setStyleSheet("color: #ffffff;")
+
+        # 协议和PID
+        detail_text = f"协议: {self.port_info.protocol.upper()}"
+        if self.port_info.pid:
+            detail_text += f" | PID: {self.port_info.pid}"
+        detail_text += f" | 地址: {self.port_info.local_addr}"
+
+        detail_label = QLabel(detail_text)
+        detail_label.setFont(QFont("微软雅黑", 9))
+        detail_label.setStyleSheet("color: #aaaaaa;")
+
+        left_layout.addWidget(port_label)
+        left_layout.addWidget(detail_label)
+
+        # 右侧：状态和操作
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setAlignment(Qt.AlignRight)
+
+        # 状态标签
+        if not self.frpc_available:
+            status_text = "frpc不可用 ❌"
+            status_color = "#f44336"
+            tip_text = "请安装 frpc"
+        elif self.is_mapped:
+            status_text = self.status_text if self.status_text else "已映射 🔗"
+            status_color = "#4CAF50"
+            tip_text = "点击关闭映射"
+        else:
+            status_text = "可映射 ➡"
+            status_color = "#2196F3"
+            tip_text = "点击开启映射"
+
+        status_label = QLabel(status_text)
+        status_label.setFont(QFont("微软雅黑", 10, QFont.Bold))
+        status_label.setStyleSheet(f"color: {status_color};")
+        status_label.setAlignment(Qt.AlignRight)
+
+        tip_label = QLabel(tip_text)
+        tip_label.setFont(QFont("微软雅黑", 8))
+        tip_label.setStyleSheet("color: #888;")
+        tip_label.setAlignment(Qt.AlignRight)
+
+        right_layout.addWidget(status_label)
+        right_layout.addWidget(tip_label)
+
+        # 添加到主布局
+        layout.addWidget(left_widget, 1)  # 左侧占据剩余空间
+        layout.addWidget(right_widget, 0, Qt.AlignRight)  # 右侧固定宽度
+
+        self.setLayout(layout)
+        self.update_style()
+
+    def update_style(self):
+        """更新样式"""
+        if not self.frpc_available:
+            bg_color = "#5a2727"  # 深红色
+            border_color = "#f44336"
+        elif self.is_mapped:
+            bg_color = "#2d5a27"  # 深绿色
+            border_color = "#4CAF50"
+        else:
+            bg_color = "#1e3a5f"  # 深蓝色
+            border_color = "#2196F3"
+
+        if self.is_hovered and self.frpc_available:  # frpc不可用时禁用悬停效果
+            bg_color = self._lighten_color(bg_color, 20)
+
+        style = f"""
+            background-color: {bg_color};
+            border: 2px solid {border_color};
+            border-radius: 8px;
+            padding: 2px;
+        """
+        self.setStyleSheet(style)
+
+    def _lighten_color(self, hex_color: str, amount: int) -> str:
+        """调亮颜色"""
+        hex_color = hex_color.lstrip('#')
+        rgb = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+        lightened = tuple(min(255, c + amount) for c in rgb)
+        return f"#{lightened[0]:02x}{lightened[1]:02x}{lightened[2]:02x}"
+
+    def mousePressEvent(self, event):
+        """鼠标点击事件"""
+        if event.button() == Qt.LeftButton and self.frpc_available:
+            self.clicked.emit(self.port_info.port)
+        elif event.button() == Qt.LeftButton and not self.frpc_available:
+            # frpc不可用时显示提示
+            from PyQt5.QtWidgets import QToolTip
+            QToolTip.showText(
+                event.globalPos(),
+                "frpc不可用，请安装 frpc 并添加到 PATH",
+                self
+            )
+
+    def enterEvent(self, event):
+        """鼠标进入事件"""
+        if self.frpc_available:  # 只有frpc可用时才启用悬停效果
+            self.is_hovered = True
+            self.update_style()
+            self.setCursor(Qt.PointingHandCursor)
+
+    def leaveEvent(self, event):
+        """鼠标离开事件"""
+        if self.frpc_available:
+            self.is_hovered = False
+            self.update_style()
+            self.setCursor(Qt.ArrowCursor)
+
+    def set_mapped(self, mapped: bool, status_text: str = ""):
+        """设置映射状态"""
+        self.is_mapped = mapped
+        if status_text:
+            self.status_text = status_text
+        self.update_style()
+
+class MainWindow(QMainWindow):
+    """主窗口类"""
+
+    def __init__(self, config_manager: ConfigManager):
+        super().__init__()
+        self.config_manager = config_manager
+
+        # 获取配置中的扫描间隔
+        scan_interval = self.config_manager.get_scan_interval()
+        ui_refresh_interval = self.config_manager.get_ui_refresh_interval()
+
+        print(f"使用扫描间隔: {scan_interval}秒")
+        print(f"使用UI刷新间隔: {ui_refresh_interval}秒")
+
+        # 创建端口扫描器（使用配置的扫描间隔）
+        self.port_scanner = PortScanner(update_interval=scan_interval)
+        self.frpc_controller = FrpcController(
+            config_manager.get_frpc_config_path()
+        )
+
+        self.port_widgets = {}  # 端口号 -> 部件映射
+        self._is_real_close = False  # 标记是否为真正关闭
+
+        # 检查 frpc 可用性
+        self.frpc_available = self.frpc_controller.is_frpc_available()
+        if not self.frpc_available:
+            print("警告: frpc 不可用，端口映射功能将受限")
+
+        # 添加调试信息输出
+        print(f"主窗口初始化完成")
+        print(f"配置文件: {config_manager.get_frpc_config_path()}")
+        print(f"frpc 可用: {self.frpc_available}")
+
+        self.setup_ui()
+        self.setup_connections()
+        self.start_services()
+
+    def setup_ui(self):
+        """设置UI"""
+        self.setWindowTitle("智能端口映射控制器")
+        self.setGeometry(100, 100, 800, 600)
+
+        # 创建中心部件
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+
+        # 标题栏
+        title_layout = QHBoxLayout()
+
+        title_label = QLabel("🔄 智能端口映射")
+        title_label.setFont(QFont("微软雅黑", 16, QFont.Bold))
+        title_label.setStyleSheet("color: #ffffff;")
+
+        # 状态标签，显示 frpc 可用性和扫描间隔
+        scan_interval = self.config_manager.get_scan_interval()
+        if self.frpc_available:
+            status_text = f"frpc 可用 | 扫描间隔: {scan_interval}秒"
+            status_color = "#4CAF50"
+        else:
+            status_text = f"frpc 不可用 | 扫描间隔: {scan_interval}秒"
+            status_color = "#f44336"
+
+        self.status_label = QLabel(status_text)
+        self.status_label.setFont(QFont("微软雅黑", 10))
+        self.status_label.setStyleSheet(f"color: {status_color};")
+
+        title_layout.addWidget(title_label)
+        title_layout.addStretch()
+        title_layout.addWidget(self.status_label)
+
+        # 端口列表容器
+        self.ports_container = QWidget()
+        self.ports_layout = QVBoxLayout(self.ports_container)
+        self.ports_layout.setSpacing(10)
+        self.ports_layout.addStretch()
+
+        # 滚动区域
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setWidget(self.ports_container)
+        scroll_area.setStyleSheet("""
+            QScrollArea {
+                border: none;
+                background-color: transparent;
+            }
+            QScrollBar:vertical {
+                background-color: #2d2d2d;
+                width: 12px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical {
+                background-color: #4a4a4a;
+                border-radius: 6px;
+                min-height: 30px;
+            }
+        """)
+
+        # 控制按钮
+        control_layout = QHBoxLayout()
+
+        self.refresh_btn = QPushButton("🔄 刷新端口")
+        self.settings_btn = QPushButton("⚙️ 设置")
+        self.app_settings_btn = QPushButton("📊 应用设置")  # 新增应用设置按钮
+        self.quit_btn = QPushButton("❌ 退出")
+
+        for btn in [self.refresh_btn, self.settings_btn, self.app_settings_btn, self.quit_btn]:
+            btn.setMinimumHeight(40)
+            btn.setFont(QFont("微软雅黑", 10))
+
+        control_layout.addWidget(self.refresh_btn)
+        control_layout.addWidget(self.settings_btn)
+        control_layout.addWidget(self.app_settings_btn)
+        control_layout.addStretch()
+        control_layout.addWidget(self.quit_btn)
+
+        # 添加到主布局
+        main_layout.addLayout(title_layout)
+        main_layout.addWidget(scroll_area, 1)
+        main_layout.addLayout(control_layout)
+
+        # 设置样式
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #1e1e1e;
+            }
+            QPushButton {
+                background-color: #2d2d2d;
+                color: white;
+                border: 2px solid #3d3d3d;
+                border-radius: 6px;
+                padding: 8px 16px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #3d3d3d;
+                border-color: #4d4d4d;
+            }
+            QPushButton:pressed {
+                background-color: #2a2a2a;
+            }
+        """)
+
+    def setup_connections(self):
+        """设置信号连接"""
+        # 按钮连接
+        self.refresh_btn.clicked.connect(self.refresh_ports)
+        self.settings_btn.clicked.connect(self.show_settings)
+        self.app_settings_btn.clicked.connect(self.show_app_settings)  # 连接应用设置
+        self.quit_btn.clicked.connect(self.real_close)
+
+        # 端口扫描器信号连接
+        self.port_scanner.ports_updated.connect(self.on_ports_updated)
+
+        # 定时刷新 - 使用配置中的UI刷新间隔
+        self.refresh_timer = QTimer()
+        self.refresh_timer.timeout.connect(self.refresh_ports)
+
+        # 转换为毫秒
+        refresh_interval_ms = self.config_manager.get_ui_refresh_interval() * 1000
+        self.refresh_timer.start(refresh_interval_ms)
+
+        print(f"UI刷新定时器启动，间隔: {refresh_interval_ms}毫秒")
+
+    def start_services(self):
+        """启动服务"""
+        # 启动端口扫描（如果未启动）
+        if not self.port_scanner._running:
+            self.port_scanner.start()
+            print(f"端口扫描器已启动，扫描间隔: {self.config_manager.get_scan_interval()}秒")
+
+        # 初始刷新
+        self.refresh_ports()
+
+    def refresh_ports(self):
+        """刷新端口列表"""
+        try:
+            # 如果端口扫描器已停止，重新启动
+            if not self.port_scanner._running:
+                print("端口扫描器已停止，重新启动...")
+                self.port_scanner.start()
+
+            # 获取监听端口
+            ports = self.port_scanner.get_listening_ports()
+
+            # 获取活跃（运行中）的代理
+            active_proxies = self.frpc_controller.get_active_proxies()
+
+            # 获取所有代理（包括非活跃的）
+            all_proxies = self.frpc_controller.get_all_proxies()
+
+            # 创建端口到代理的映射
+            port_to_proxy = {}
+            for proxy in all_proxies:
+                port_to_proxy[proxy.local_port] = proxy
+
+            # 清空现有部件（除了占位的stretch）
+            while self.ports_layout.count() > 1:  # 保留最后的stretch
+                item = self.ports_layout.itemAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+                self.ports_layout.removeItem(item)
+
+            self.port_widgets.clear()
+
+            # 按端口号排序
+            ports.sort(key=lambda x: x.port)
+
+            # 创建并添加端口部件
+            for port_info in ports:
+                port = port_info.port
+
+                # 检查端口是否有对应的代理
+                proxy = port_to_proxy.get(port)
+
+                if proxy:
+                    # 端口有代理
+                    is_mapped = proxy.is_active
+                    status_text = proxy.status.value
+                else:
+                    # 端口无代理
+                    is_mapped = False
+                    status_text = ""
+
+                # 创建端口部件
+                widget = PortItemWidget(
+                    port_info,
+                    is_mapped=is_mapped,
+                    frpc_available=self.frpc_available,
+                    status_text=status_text
+                )
+                widget.clicked.connect(self.on_port_clicked)
+
+                # 添加到布局
+                self.ports_layout.insertWidget(
+                    self.ports_layout.count() - 1,  # 插入到stretch之前
+                    widget
+                )
+
+                # 保存到字典
+                self.port_widgets[port] = widget
+
+            # 更新状态标签
+            active_count = len(active_proxies)
+            total_count = len(ports)
+            scan_interval = self.config_manager.get_scan_interval()
+
+            if self.frpc_available:
+                status_text = f"frpc 可用 | 端口: {total_count} | 活跃映射: {active_count} | 扫描间隔: {scan_interval}秒"
+                status_color = "#4CAF50"
+            else:
+                status_text = f"frpc 不可用 | 端口: {total_count} | 扫描间隔: {scan_interval}秒"
+                status_color = "#f44336"
+
+            self.status_label.setText(status_text)
+            self.status_label.setStyleSheet(f"color: {status_color};")
+
+            # 如果没有找到端口，显示提示
+            if total_count == 0:
+                no_ports_label = QLabel("未检测到任何监听端口")
+                no_ports_label.setAlignment(Qt.AlignCenter)
+                no_ports_label.setStyleSheet("color: #888; font-size: 12px;")
+                self.ports_layout.insertWidget(0, no_ports_label)
+
+        except Exception as e:
+            print(f"刷新端口失败: {e}")
+            traceback.print_exc()
+
+    def on_ports_updated(self, added, removed, changed):
+        """端口更新回调 - 通过信号触发"""
+        # 这是通过信号调用的，已经在主线程中，可以直接刷新
+        self.refresh_ports()
+
+    def on_port_clicked(self, port: int):
+        """端口点击事件"""
+        # 检查 frpc 是否可用
+        if not self.frpc_available:
+            QMessageBox.warning(
+                self,
+                "frpc 不可用",
+                "frpc 不可用，无法进行端口映射。\n"
+                "请确保 frpc 已安装并添加到系统 PATH 中。\n\n"
+                "下载地址: https://github.com/fatedier/frp/releases"
+            )
+            return
+
+        # 根据本地端口查找代理（而不是使用固定名称）
+        proxy = self.frpc_controller.get_proxy_by_local_port(port)
+
+        if proxy and proxy.is_active:
+            # 已映射且活跃，点击关闭
+            reply = QMessageBox.question(
+                self, "确认关闭",
+                f"确定要关闭端口 {port} 的映射吗？\n"
+                f"当前映射: {proxy.local_port} -> {proxy.remote_port}",
+                QMessageBox.Yes | QMessageBox.No
+            )
+
+            if reply == QMessageBox.Yes:
+                success = self.frpc_controller.remove_proxy(proxy.name)
+                if success:
+                    QMessageBox.information(
+                        self, "成功",
+                        f"已关闭端口映射: {proxy.local_port} -> {proxy.remote_port}"
+                    )
+                    self.refresh_ports()
+                else:
+                    QMessageBox.warning(self, "失败", "关闭映射失败")
+        elif proxy and not proxy.is_active:
+            # 有代理但未激活，询问是否激活
+            reply = QMessageBox.question(
+                self, "代理未激活",
+                f"端口 {port} 的代理已存在但未激活。\n"
+                f"是否要激活映射: {proxy.local_port} -> {proxy.remote_port}？",
+                QMessageBox.Yes | QMessageBox.No
+            )
+
+            if reply == QMessageBox.Yes:
+                start_success, start_message = self.frpc_controller.start_proxy(proxy.name)
+                if start_success:
+                    QMessageBox.information(self, "成功", start_message)
+                    self.refresh_ports()
+                else:
+                    QMessageBox.warning(self, "失败", start_message)
+        else:
+            # 未映射，点击打开
+            remote_port, ok = QInputDialog.getInt(
+                self, "远程端口",
+                f"请输入端口 {port} 的远程映射端口:",
+                value=port, min=1, max=65535
+            )
+
+            if ok:
+                # 添加代理
+                success, message = self.frpc_controller.add_proxy(port, remote_port)
+
+                if success:
+                    # 添加成功后再次查找代理
+                    proxy = self.frpc_controller.get_proxy_by_local_port(port)
+                    if proxy:
+                        # 根据配置决定是否自动启动代理
+                        if self.config_manager.app_config.auto_start_proxy:
+                            # 启动代理
+                            start_success, start_message = self.frpc_controller.start_proxy(proxy.name)
+
+                            if start_success:
+                                QMessageBox.information(
+                                    self, "成功",
+                                    f"已开启端口映射: {proxy.local_port} -> {proxy.remote_port}"
+                                )
+                                self.refresh_ports()
+                            else:
+                                QMessageBox.warning(self, "失败", start_message)
+                                # 启动失败，移除代理
+                                self.frpc_controller.remove_proxy(proxy.name)
+                        else:
+                            # 不自动启动，只创建配置
+                            QMessageBox.information(
+                                self, "成功",
+                                f"已创建代理配置，但未自动启动。\n"
+                                f"映射: {proxy.local_port} -> {proxy.remote_port}"
+                            )
+                            self.refresh_ports()
+                    else:
+                        QMessageBox.warning(self, "失败", "添加代理后未找到代理配置")
+                else:
+                    QMessageBox.warning(self, "失败", message)
+
+    def show_settings(self):
+        """显示服务器设置"""
+        from setup_wizard import SetupWizard
+        wizard = SetupWizard(self.config_manager)
+        if wizard.exec_and_setup():
+            # 配置已更新，重新初始化FRP控制器
+            self.frpc_controller = FrpcController(
+                self.config_manager.get_frpc_config_path()
+            )
+            self.frpc_available = self.frpc_controller.is_frpc_available()
+            QMessageBox.information(self, "成功", "服务器设置已更新")
+
+    def show_app_settings(self):
+        """显示应用程序设置"""
+        from PyQt5.QtWidgets import (
+            QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
+            QLabel, QSpinBox, QCheckBox, QPushButton,
+            QGroupBox
+        )
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("应用程序设置")
+        dialog.setGeometry(200, 200, 400, 300)
+
+        layout = QVBoxLayout()
+
+        # 扫描设置组
+        scan_group = QGroupBox("扫描设置")
+        scan_layout = QFormLayout()
+
+        # 端口扫描间隔
+        self.scan_interval_spin = QSpinBox()
+        self.scan_interval_spin.setRange(5, 300)  # 5秒到5分钟
+        self.scan_interval_spin.setValue(self.config_manager.get_scan_interval())
+        self.scan_interval_spin.setSuffix(" 秒")
+        scan_layout.addRow("端口扫描间隔:", self.scan_interval_spin)
+
+        # UI刷新间隔
+        self.ui_refresh_spin = QSpinBox()
+        self.ui_refresh_spin.setRange(2, 60)  # 2秒到1分钟
+        self.ui_refresh_spin.setValue(self.config_manager.get_ui_refresh_interval())
+        self.ui_refresh_spin.setSuffix(" 秒")
+        scan_layout.addRow("UI刷新间隔:", self.ui_refresh_spin)
+
+        scan_group.setLayout(scan_layout)
+        layout.addWidget(scan_group)
+
+        # 行为设置组
+        behavior_group = QGroupBox("行为设置")
+        behavior_layout = QVBoxLayout()
+
+        # 自动启动代理
+        self.auto_start_check = QCheckBox("添加代理后自动启动")
+        self.auto_start_check.setChecked(self.config_manager.app_config.auto_start_proxy)
+        behavior_layout.addWidget(self.auto_start_check)
+
+        # 最小化到托盘
+        self.minimize_check = QCheckBox("关闭窗口时最小化到托盘")
+        self.minimize_check.setChecked(self.config_manager.app_config.minimize_to_tray)
+        behavior_layout.addWidget(self.minimize_check)
+
+        # 显示系统端口
+        self.system_ports_check = QCheckBox("显示系统端口 (<1024)")
+        self.system_ports_check.setChecked(self.config_manager.app_config.show_system_ports)
+        behavior_layout.addWidget(self.system_ports_check)
+
+        behavior_group.setLayout(behavior_layout)
+        layout.addWidget(behavior_group)
+
+        # 按钮
+        button_layout = QHBoxLayout()
+
+        save_btn = QPushButton("保存")
+        save_btn.clicked.connect(lambda: self.save_app_settings(dialog))
+
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(dialog.reject)
+
+        button_layout.addStretch()
+        button_layout.addWidget(save_btn)
+        button_layout.addWidget(cancel_btn)
+
+        layout.addLayout(button_layout)
+
+        dialog.setLayout(layout)
+        dialog.exec_()
+
+    def save_app_settings(self, dialog):
+        """保存应用程序设置"""
+        try:
+            # 保存扫描设置
+            self.config_manager.set_scan_interval(self.scan_interval_spin.value())
+            self.config_manager.set_ui_refresh_interval(self.ui_refresh_spin.value())
+
+            # 保存行为设置
+            self.config_manager.app_config.auto_start_proxy = self.auto_start_check.isChecked()
+            self.config_manager.app_config.minimize_to_tray = self.minimize_check.isChecked()
+            self.config_manager.app_config.show_system_ports = self.system_ports_check.isChecked()
+
+            # 保存配置
+            if self.config_manager.save():
+                # 更新端口扫描器的扫描间隔
+                scan_interval = self.config_manager.get_scan_interval()
+                self.port_scanner.update_interval = scan_interval
+                print(f"端口扫描间隔已更新为: {scan_interval}秒")
+
+                # 更新UI刷新定时器
+                refresh_interval_ms = self.config_manager.get_ui_refresh_interval() * 1000
+                self.refresh_timer.stop()
+                self.refresh_timer.start(refresh_interval_ms)
+                print(f"UI刷新间隔已更新为: {refresh_interval_ms}毫秒")
+
+                # 刷新状态标签
+                self.refresh_ports()
+
+                QMessageBox.information(dialog, "成功", "应用程序设置已保存")
+                dialog.accept()
+            else:
+                QMessageBox.warning(dialog, "错误", "保存设置失败")
+        except Exception as e:
+            QMessageBox.critical(dialog, "错误", f"保存设置时出错: {str(e)}")
+
+    def real_close(self):
+        """真正的关闭程序"""
+        self._is_real_close = True
+        self.close()
+
+    def closeEvent(self, event):
+        """关闭事件"""
+        # 根据配置决定是否最小化到托盘
+        if self.config_manager.app_config.minimize_to_tray and not self._is_real_close:
+            # 最小化到托盘
+            print("最小化到托盘...")
+            self.hide()
+            event.ignore()
+        else:
+            # 真正退出程序
+            print("正在停止服务并退出程序...")
+
+            # 停止定时器
+            if self.refresh_timer:
+                self.refresh_timer.stop()
+
+            # 停止端口扫描
+            self.port_scanner.stop()
+
+            # 停止FRP控制器
+            self.frpc_controller.stop_all()
+
+            # 保存配置
+            self.config_manager.save()
+
+            # 退出应用程序
+            QApplication.quit()
+
+    def showEvent(self, event):
+        """窗口显示事件"""
+        super().showEvent(event)
+        # 窗口重新显示时刷新端口列表
+        if self.isVisible():
+            print("窗口重新显示，刷新端口列表...")
+            self.refresh_ports()
